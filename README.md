@@ -57,6 +57,9 @@
 ---
 
 ## **View Data in Sembast**
+
+You may use: https://github.com/weebi-com/sembast_gui
+
 The database is just a JSON file. Open it in any text editor:  
 ```text
 bin/db/phrases.db
