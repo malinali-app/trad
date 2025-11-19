@@ -92,7 +92,7 @@ void main() async {
     print('  ✓ Total translations imported: $totalImported');
     print('');
     print('All existing translations are now in the database!');
-    print('You can now use update_translations.dart for incremental updates.');
+    print('You can now use main.dart for incremental updates.');
     
   } finally {
     await phraseStore.close();

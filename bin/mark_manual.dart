@@ -60,7 +60,7 @@ void main(List<String> arguments) async {
       print('  ⚠ Not found: ${notFoundCount.length}');
     }
     print('');
-    print('These translations will not be overwritten by update_translations.dart');
+    print('These translations will not be overwritten by main.dart');
     
   } finally {
     await phraseStore.close();

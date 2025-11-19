@@ -5,22 +5,36 @@ import 'dart:io';
 // Project imports:
 import 'locales.dart';
 import 'models.dart';
+import 'phrase_store.dart';
 import 'translate.dart';
 
+/// Translation tool - translates new or changed phrases by default
+/// Use --force to translate all phrases
 void main(List<String> arguments) async {
+  final forceTranslation = arguments.contains('--force');
   final outputDir = await Directory('bin/output').create();
-  await createTranslations(outputDir);
+  final phraseStore = PhraseStore();
+  
+  try {
+    await updateTranslations(outputDir, phraseStore, forceTranslation: forceTranslation);
+  } finally {
+    await phraseStore.close();
+  }
+  
+  print('\nTranslation complete!');
 }
 
 Map<String, String> get phrasesMap {
-  final contents = File('bin/input/phrases.json').readAsStringSync();
-  final jsonPhrases = json.decode(contents);
+  final contents = File('bin/input/app_en.arb').readAsStringSync();
+  final Map<String, dynamic> arbData = json.decode(contents);
 
   final map = <String, String>{};
 
-  for (final phrase in jsonPhrases) {
-    final miniMap = Map<String, String>.from(phrase);
-    map[miniMap.keys.first] = miniMap.values.first;
+  // Filter out ARB metadata (keys starting with @) and convert to map
+  for (final entry in arbData.entries) {
+    if (!entry.key.startsWith('@')) {
+      map[entry.key] = entry.value.toString();
+    }
   }
   return map;
 }
@@ -32,17 +46,65 @@ Future<File> makeFileAndWriteAsStringAsync(
   return fileWritten;
 }
 
-Future<Directory> createDirectory(String folderPath) async {
-  final dir = await Directory(folderPath).create();
-  if (dir.path.isEmpty) {
-    throw "invalid output directory path";
+/// Detect changes and translate only what's needed
+Future<void> updateTranslations(
+  Directory outputDir,
+  PhraseStore phraseStore,
+  {bool forceTranslation = false}
+) async {
+  final currentPhrases = phrasesMap;
+  List<MapEntry<String, String>> phrasesToTranslate = [];
+
+  if (forceTranslation) {
+    // Force translation of all phrases
+    phrasesToTranslate = currentPhrases.entries.toList();
+    print('Force translating all ${phrasesToTranslate.length} phrases...\n');
+  } else {
+    // Get phrases that need translation (new or changed)
+    phrasesToTranslate = 
+        await phraseStore.getPhrasesNeedingTranslation(currentPhrases);
+  
+    if (phrasesToTranslate.isEmpty) {
+      print('✓ No changes detected. All phrases are up to date!');
+      return;
+    }
+  
+    print('Found ${phrasesToTranslate.length} phrases that need translation:');
+    for (final entry in phrasesToTranslate) {
+      print('  - ${entry.key}');
+    }
   }
-  return dir;
+  print('');
+  
+  // Update the phrase store with new/changed phrases
+  final updatedPhrases = phrasesToTranslate.map((e) => StoredPhrase(
+    key: e.key,
+    value: e.value,
+    lastUpdated: DateTime.now(),
+  )).toList();
+  
+  await phraseStore.savePhrases(updatedPhrases);
+  print('✓ Updated phrase store\n');
+  
+  // Now translate only the changed phrases for all languages
+  final files = <File>[];
+  for (final locale in localesSupportedAzureTranslatorMinusFlutterUnsupported) {
+    final file = await translateDeltaForLocale(
+      locale,
+      currentPhrases,
+      phrasesToTranslate,
+      outputDir,
+      phraseStore,
+    );
+    files.add(file);
+  }
+  
+  print('\n✓ Translated ${phrasesToTranslate.length} phrases for ${files.length} languages');
 }
 
 /// Retry translation with exponential backoff for rate limiting
 /// Azure can take up to 15s for large batches, so we use conservative delays
-Future<List<String>> translateWithRetry(
+Future<List<String>> _translateWithRetry(
   String fromLocale,
   String toLocale,
   List<String> phrases, {
@@ -55,24 +117,18 @@ Future<List<String>> translateWithRetry(
   while (attempt < maxRetries) {
     try {
       return await Translate.translateWithAzure(fromLocale, toLocale, phrases);
-    } catch (e) {
-      // Check if it's a rate limit error (429)
-      if (e.toString().contains('429') || e.toString().contains('Rate limit')) {
-        attempt++;
-        if (attempt >= maxRetries) {
-          print('  Max retries ($maxRetries) reached for rate limit');
-          rethrow;
-        }
-        
-        // Exponential backoff: 10s, 20s, 40s
-        // Conservative delays to respect Azure rate limits
-        final waitTime = delay * (1 << (attempt - 1));
-        print('  Rate limited. Waiting ${waitTime.inSeconds}s before retry $attempt/$maxRetries...');
-        await Future.delayed(waitTime);
-      } else {
-        // Not a rate limit error, rethrow immediately
+    } on RateLimitException {
+      attempt++;
+      if (attempt >= maxRetries) {
+        print('  ⚠ Max retries ($maxRetries) reached for rate limit');
         rethrow;
       }
+      
+      // Exponential backoff: 10s, 20s, 40s
+      // Conservative delays to respect Azure rate limits
+      final waitTime = delay * (1 << (attempt - 1));
+      print('  ⏳ Rate limited. Waiting ${waitTime.inSeconds}s before retry $attempt/$maxRetries...');
+      await Future.delayed(waitTime);
     }
   }
   
@@ -80,76 +136,132 @@ Future<List<String>> translateWithRetry(
   return [];
 }
 
-Future<File> requestTranslations(String locale, Directory outputDir) async {
-  final arb = Arb(locale, phrasesMap);
-  final phrases = phrasesMap;
-  final keysError = <String>[];
-  print('begin translate  $locale');
+/// Translate only changed phrases for a specific locale and merge with existing
+Future<File> translateDeltaForLocale(
+  String locale,
+  Map<String, String> allPhrases,
+  List<MapEntry<String, String>> phrasesToTranslate,
+  Directory outputDir,
+  PhraseStore phraseStore,
+) async {
+  print('Translating for $locale (${phrasesToTranslate.length} phrases)...');
   
-  // Batch phrases into chunks of 100
-  final entries = phrases.entries.toList();
-  const batchSize = 100;
-  // 3 seconds between batches - Azure can take up to 15s per batch of 100 phrases
-  const delayBetweenBatches = Duration(seconds: 3);
+  // Load existing translations from DB
+  final existingTranslations = await phraseStore.getTranslationsForLocale(locale);
+  final translationsMap = <String, String>{};
   
-  for (int i = 0; i < entries.length; i += batchSize) {
-    final end = (i + batchSize < entries.length) ? i + batchSize : entries.length;
-    final batch = entries.sublist(i, end);
-    final batchNumber = i ~/ batchSize + 1;
-    
-    print('Translating batch $batchNumber (${batch.length} phrases)');
-    
-    // Extract phrases to translate
-    final phrasesToTranslate = batch.map((e) => e.value).toList();
-    
-    // Call Azure API with batch and retry logic for rate limiting
-    List<String>? translations;
-    try {
-      translations = await translateWithRetry('en', locale, phrasesToTranslate);
-    } catch (e) {
-      print('error on batch $batchNumber: $e');
-      keysError.addAll(batch.map((e) => e.key));
+  // Populate with existing translations
+  for (final entry in existingTranslations.entries) {
+    translationsMap[entry.key] = entry.value.value;
+  }
+  
+  // Filter phrases to translate: skip manual translations
+  final phrasesNeedingTranslation = <MapEntry<String, String>>[];
+  final skippedManual = <String>[];
+  
+  for (final entry in phrasesToTranslate) {
+    final isManual = await phraseStore.isManualTranslation(entry.key, locale);
+    if (isManual) {
+      skippedManual.add(entry.key);
+      // Keep existing manual translation
       continue;
     }
+    phrasesNeedingTranslation.add(entry);
+  }
+  
+  if (skippedManual.isNotEmpty) {
+    print('  ⚠ Skipped ${skippedManual.length} manual translations');
+  }
+  
+  if (phrasesNeedingTranslation.isEmpty) {
+    print('  ✓ No new phrases to translate');
+    // Still write ARB file with existing translations
+  } else {
+    // Translate in batches of 100
+    final keysError = <String>[];
+    const batchSize = 100;
+    // 3 seconds between batches - Azure can take up to 15s per batch of 100 phrases
+    const delayBetweenBatches = Duration(seconds: 3);
     
-    // Check if translation failed
-    if (translations.isEmpty || translations.length != phrasesToTranslate.length) {
-      print('error on batch $batchNumber');
-      keysError.addAll(batch.map((e) => e.key));
-    } else {
-      // Map translations back to their keys
-      for (int j = 0; j < batch.length; j++) {
-        arb.map[batch[j].key] = translations[j];
+    for (int i = 0; i < phrasesNeedingTranslation.length; i += batchSize) {
+      final end = (i + batchSize < phrasesNeedingTranslation.length) 
+          ? i + batchSize 
+          : phrasesNeedingTranslation.length;
+      final batch = phrasesNeedingTranslation.sublist(i, end);
+      final batchNumber = i ~/ batchSize + 1;
+      
+      // Extract phrases to translate
+      final phrasesInBatch = batch.map((e) => e.value).toList();
+      
+      // Call Azure API with batch and retry logic for rate limiting
+      List<String>? translations;
+      try {
+        translations = await _translateWithRetry(
+          'en',
+          locale,
+          phrasesInBatch,
+          maxRetries: 3,
+        );
+      } on RateLimitException {
+        print('  ✗ Rate limit exceeded on batch $batchNumber after retries');
+        keysError.addAll(batch.map((e) => e.key));
+        continue;
+      } catch (e) {
+        print('  ✗ Unexpected error on batch $batchNumber: $e');
+        keysError.addAll(batch.map((e) => e.key));
+        continue;
+      }
+      
+      // Check if translation failed
+      if (translations.isEmpty || translations.length != phrasesInBatch.length) {
+        print('  ✗ Error on batch $batchNumber');
+        keysError.addAll(batch.map((e) => e.key));
+      } else {
+        // Save translations to database and map
+        final translationsToSave = <StoredTranslation>[];
+        for (int j = 0; j < batch.length; j++) {
+          final phraseKey = batch[j].key;
+          final translatedValue = translations[j];
+          
+          translationsMap[phraseKey] = translatedValue;
+          
+          translationsToSave.add(StoredTranslation(
+            phraseKey: phraseKey,
+            locale: locale,
+            value: translatedValue,
+            translatedBy: 'azure',
+            lastUpdated: DateTime.now(),
+          ));
+        }
+        
+        // Save to database
+        await phraseStore.saveTranslations(translationsToSave);
+      }
+      
+      // Space out requests to avoid rate limiting
+      if (i + batchSize < phrasesNeedingTranslation.length) {
+        await Future.delayed(delayBetweenBatches);
       }
     }
     
-    // Space out requests to avoid rate limiting
-    if (i + batchSize < entries.length) {
-      await Future.delayed(delayBetweenBatches);
+    if (keysError.isNotEmpty) {
+      print('  ✗ Failed: ${keysError.length} errors');
+      final normalizedLocale = normalizeLocaleForArbFilename(locale);
+      return await makeFileAndWriteAsStringAsync(
+          keysError.toString(), outputDir.path, 'app_errors_$normalizedLocale.txt');
     }
   }
   
-  if (keysError.isNotEmpty) {
-    return await makeFileAndWriteAsStringAsync(
-        keysError.toString(), outputDir.path, 'app_errors_${normalizeLocaleForArbFilename(locale)}.txt');
-  } else {
-    final normalizedLocale = normalizeLocaleForArbFilename(locale);
-    final file = await makeFileAndWriteAsStringAsync(
-        json.encode(arb.map), outputDir.path, 'app_$normalizedLocale.arb');
-    if (file.existsSync() == false) {
-      throw 'error saving file';
-    }
-    print('finished translating $locale');
-    return file;
+  // Create final ARB with all translations from database
+  final finalArb = Arb(locale, translationsMap);
+  
+  // Normalize locale for filename (remove script identifiers)
+  final normalizedLocale = normalizeLocaleForArbFilename(locale);
+  final file = await makeFileAndWriteAsStringAsync(
+      json.encode(finalArb.map), outputDir.path, 'app_$normalizedLocale.arb');
+  if (!file.existsSync()) {
+    throw 'error saving file';
   }
-}
-
-Future<List<File>> createTranslations(Directory directory) async {
-  final files = <File>[];
-  // instead use locales
-  for (final locale in localesSupportedAzureTranslatorMinusFlutterUnsupported) {
-    final file = await requestTranslations(locale, directory);
-    files.add(file);
-  }
-  return files;
+  print('  ✓ Done');
+  return file;
 }
