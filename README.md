@@ -2,7 +2,6 @@
 *A Dart-based CLI for translation & localization.*
 
 ---
-
 ## **How It Works**
 
 The translation tool uses incremental updates by default:
@@ -11,6 +10,11 @@ The translation tool uses incremental updates by default:
 - **Manual translations:** Marked translations are preserved and never overwritten
 - **Database:** Changes are tracked in `bin/db/phrases.db` (Sembast)
 - **Batching:** API calls are batched (100 phrases per request) to optimize performance  
+
+---
+## Caveats
+- The tool relies on machine translation APIs that are designed to translate text, not complex .arb structures
+- while you might send this elements, prefer flat text
 
 ---
 
