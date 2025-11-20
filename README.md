@@ -1,5 +1,5 @@
 # **trad**  
-*A Dart-based CLI for translation & localization.*
+*A Dart-based CLI for free translation & localization.*
 
 ---
 ## **How It Works**
@@ -13,8 +13,8 @@ The translation tool uses incremental updates by default:
 
 ---
 ## Caveats
-- The tool relies on machine translation APIs that are designed to translate text, not complex .arb structures
-- while you might send this elements, prefer flat text
+- The Azure translator __freemium__ includes 2 million characters per month ([full pricing](https://azure.microsoft.com/en-us/pricing/details/cognitive-services/translator)), 
+- The tool relies on this (generous) machine translation API designed to translate __text__, not complex .arb structures so prefer flat text (e.g. better have three entries, _user_, _users_ and _userNone_)
 
 ---
 
