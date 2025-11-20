@@ -1,4 +1,4 @@
-# **dartrad**  
+# **trad**  
 *A Dart-based CLI for translation & localization.*
 
 ---
